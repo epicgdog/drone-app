@@ -1,0 +1,426 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Pose Viewer</title>
+<style>
+  :root { --bg: #0b0d10; --panel: #15181d; --text: #e6e8eb; --muted: #8a919c; --ok: #22c55e; --bad: #ef4444; --warn: #f59e0b; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font: 13px/1.4 ui-monospace, Menlo, monospace; }
+  #app { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr); height: 100%; gap: 8px; padding: 8px; }
+  @media (max-width: 800px) { #app { grid-template-columns: 1fr; grid-template-rows: 40vh 1fr; } }
+  .panel { position: relative; background: var(--panel); border-radius: 8px; overflow: hidden; min-height: 0; }
+  #frame { width: 100%; height: 100%; object-fit: contain; display: block; }
+  #scene { width: 100%; height: 100%; display: block; }
+  .hud { position: absolute; top: 8px; left: 8px; background: rgba(0,0,0,.55); padding: 6px 8px; border-radius: 6px; white-space: pre; pointer-events: none; }
+  .controls { position: absolute; top: 8px; right: 8px; display: flex; gap: 4px; }
+  .controls button { background: rgba(0,0,0,.55); color: var(--text); border: 1px solid #333; border-radius: 6px; padding: 4px 10px; font: inherit; cursor: pointer; }
+  .controls button.active { background: #3b82f6; border-color: #3b82f6; }
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; background: var(--bad); }
+  .dot.on { background: var(--ok); }
+  #placeholder { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.186.1/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.186.1/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="app">
+  <div class="panel">
+    <img id="frame" alt="" />
+    <div id="placeholder">Waiting for the phone to stream…</div>
+    <div class="hud" id="conn"><span class="dot" id="dot"></span>connecting</div>
+  </div>
+  <div class="panel">
+    <canvas id="scene"></canvas>
+    <div class="hud" id="stats">—</div>
+    <div class="controls" id="modes">
+      <button data-mode="stick">Stick</button>
+      <button data-mode="avatar">Avatar</button>
+      <button data-mode="both" class="active">Both</button>
+      <button id="limits" class="active" title="Clamp the avatar to human joint ranges">Limits</button>
+      <button id="smooth" class="active" title="Ease the avatar between poses">Smooth</button>
+    </div>
+  </div>
+</div>
+
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+
+// ---- Skeleton (mirrors mobile/src/pose/skeleton.ts) -------------------------
+const PARENTS = [-1, 0, 1, 2, 0, 4, 5, 0, 7, 8, 9, 8, 11, 12, 8, 14, 15];
+const GROUPS = ["c","r","r","r","l","l","l","c","c","c","c","l","l","l","r","r","r"];
+const COLORS = { l: 0x3b82f6, r: 0xef4444, c: 0xffffff };
+const BONES = PARENTS.map((p, c) => ({ parent: p, child: c })).filter((b) => b.parent >= 0);
+const PELVIS = 0, HEAD_TOP = 10, L_ANKLE = 6, R_ANKLE = 3;
+
+// ---- Coordinates (mirrors mobile/src/pose/coords.ts) ------------------------
+// FMPose3D world is Z-up; three.js is Y-up. (x, y, z) -> (x, z, -y).
+const toThree = ([x, y, z]) => new THREE.Vector3(x, z, -y);
+function toSceneJoints(joints) {
+  const v = joints.map(toThree);
+  const pelvis = v[PELVIS].clone();
+  v.forEach((p) => p.sub(pelvis));
+  const height = v[HEAD_TOP].y - Math.min(v[L_ANKLE].y, v[R_ANKLE].y);
+  if (height > 0 && (height < 1.5 || height > 2.0)) {
+    const s = 1.7 / height;
+    v.forEach((p) => p.multiplyScalar(s));
+  }
+  return v;
+}
+
+// ---- Scene ------------------------------------------------------------------
+const canvas = document.getElementById("scene");
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x15181d);
+const camera = new THREE.PerspectiveCamera(50, 1, 0.01, 100);
+camera.position.set(1.2, 1.0, 3.0);
+const controls = new OrbitControls(camera, canvas);
+controls.target.set(0, 0, 0);
+controls.update();
+scene.add(new THREE.AmbientLight(0xffffff, 0.8));
+const sun = new THREE.DirectionalLight(0xffffff, 1.2);
+sun.position.set(2, 3, 2);
+scene.add(sun);
+const grid = new THREE.GridHelper(4, 16, 0x444444, 0x2a2a2a);
+grid.position.y = -1.0;
+scene.add(grid, new THREE.AxesHelper(0.5));
+
+function resize() {
+  const { clientWidth: w, clientHeight: h } = canvas.parentElement;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+}
+new ResizeObserver(resize).observe(canvas.parentElement);
+resize();
+const clock = new THREE.Clock();
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), 0.1);
+  animateAvatar(dt);
+  controls.update();
+  renderer.render(scene, camera);
+});
+
+// ---- Stick figure -----------------------------------------------------------
+const stick = new THREE.Group();
+scene.add(stick);
+const sphereGeo = new THREE.SphereGeometry(0.03, 12, 12);
+const boneGeo = new THREE.CylinderGeometry(0.015, 0.015, 1, 8);
+const jointMeshes = GROUPS.map((g) => {
+  const m = new THREE.Mesh(sphereGeo, new THREE.MeshBasicMaterial({ color: COLORS[g], transparent: true }));
+  stick.add(m);
+  return m;
+});
+const boneMeshes = BONES.map((b) => {
+  const m = new THREE.Mesh(boneGeo, new THREE.MeshBasicMaterial({ color: COLORS[GROUPS[b.child]], transparent: true }));
+  stick.add(m);
+  return m;
+});
+const UP = new THREE.Vector3(0, 1, 0);
+function updateStick(joints, opacity) {
+  joints.forEach((p, i) => { jointMeshes[i].position.copy(p); jointMeshes[i].material.opacity = opacity; });
+  BONES.forEach((b, i) => {
+    const m = boneMeshes[i];
+    const dir = joints[b.child].clone().sub(joints[b.parent]);
+    const len = dir.length();
+    m.position.copy(joints[b.parent]).addScaledVector(dir, 0.5);
+    m.scale.set(1, Math.max(len, 1e-6), 1);
+    if (len > 1e-6) m.quaternion.setFromUnitVectors(UP, dir.normalize());
+    m.material.opacity = opacity;
+  });
+}
+
+// ---- Avatar (mirrors mobile/src/scene/Avatar.tsx; avatar-space retargeting) --
+const BONE_TABLE = [
+  [0, 7, "Spine"], [7, 8, "Spine2"], [8, 9, "Neck"], [9, 10, "Head"],
+  [11, 12, "LeftArm"], [12, 13, "LeftForeArm"], [14, 15, "RightArm"], [15, 16, "RightForeArm"],
+  [4, 5, "LeftUpLeg"], [5, 6, "LeftLeg"], [1, 2, "RightUpLeg"], [2, 3, "RightLeg"],
+];
+
+// ---- Joint limits -----------------------------------------------------------
+// Angles are relative to the rest (T-)pose, in degrees.
+//   cone:  max swing of the bone away from its rest direction; twist: max roll about it.
+//   hinge: single-axis joint; bend allowed only toward `bend` ("forward"/"back"
+//   relative to the body), within [0, max].
+const D = Math.PI / 180;
+const LIMITS = {
+  Spine:        { cone: 30 * D, twist: 20 * D },
+  Spine2:       { cone: 30 * D, twist: 20 * D },
+  Neck:         { cone: 45 * D, twist: 60 * D },
+  Head:         { cone: 40 * D, twist: 30 * D },
+  LeftArm:      { cone: 170 * D, twist: 90 * D, hingeChild: "LeftForeArm" },
+  RightArm:     { cone: 170 * D, twist: 90 * D, hingeChild: "RightForeArm" },
+  LeftForeArm:  { hinge: true, bend: "forward", max: 150 * D },
+  RightForeArm: { hinge: true, bend: "forward", max: 150 * D },
+  LeftUpLeg:    { cone: 120 * D, twist: 45 * D, hingeChild: "LeftLeg" },
+  RightUpLeg:   { cone: 120 * D, twist: 45 * D, hingeChild: "RightLeg" },
+  LeftLeg:      { hinge: true, bend: "back", max: 150 * D },
+  RightLeg:     { hinge: true, bend: "back", max: 150 * D },
+};
+let limitsOn = true;
+
+const normName = (n) => n.replace(/^mixamorig:?/i, "").replace(/_\d+$/, "").toLowerCase();
+function frameQuat(right, up) {
+  const r = right.clone().normalize();
+  const f = new THREE.Vector3().crossVectors(r, up.clone().normalize()).normalize();
+  const u = new THREE.Vector3().crossVectors(f, r).normalize();
+  return new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().makeBasis(r, u, f));
+}
+const axisAngle = (axis, angle) => new THREE.Quaternion().setFromAxisAngle(axis, angle);
+const quatAngle = (q) => 2 * Math.acos(Math.min(1, Math.abs(q.w)));
+const canonical = (q) => (q.w < 0 ? q.set(-q.x, -q.y, -q.z, -q.w) : q);
+
+/** Split q (canonical) into swing * twist, twist being rotation about unit `axis`. */
+function swingTwist(q, axis) {
+  const p = axis.clone().multiplyScalar(q.x * axis.x + q.y * axis.y + q.z * axis.z);
+  const twist = new THREE.Quaternion(p.x, p.y, p.z, q.w);
+  if (twist.lengthSq() < 1e-12) twist.identity(); else twist.normalize();
+  const swing = q.clone().multiply(twist.clone().invert());
+  return { swing, twist };
+}
+/** Signed rotation angle of `twist` about `axis`, in (-π, π]. */
+const twistAngle = (twist, axis) =>
+  2 * Math.atan2(twist.x * axis.x + twist.y * axis.y + twist.z * axis.z, twist.w);
+const clampQuatAngle = (q, max) => {
+  const a = quatAngle(q);
+  return a > max ? new THREE.Quaternion().slerp(q, max / a) : q;
+};
+
+/** Constrain a bone's local rotation. `d` is its change from rest, in the bone's rest frame. */
+function constrainLocal(e, local) {
+  const lim = e.limits;
+  if (!lim) return local;
+  const d = canonical(e.restLocal.clone().invert().multiply(local));
+  let c;
+  if (lim.hinge) {
+    // Keep only the rotation about the hinge axis, clamped to [0, max] bend.
+    const { twist } = swingTwist(d, e.hingeLocal);
+    const theta = Math.min(lim.max, Math.max(0, twistAngle(twist, e.hingeLocal)));
+    c = axisAngle(e.hingeLocal, theta);
+  } else {
+    const { swing, twist } = swingTwist(d, e.axisLocal);
+    const tw = Math.max(-lim.twist, Math.min(lim.twist, twistAngle(twist, e.axisLocal)));
+    c = clampQuatAngle(canonical(swing), lim.cone).multiply(axisAngle(e.axisLocal, tw));
+  }
+  return e.restLocal.clone().multiply(c);
+}
+
+let avatar = null; // { root, hips, hipsRestA, restFrameQuat, entries }
+new GLTFLoader().load("/viewer/avatar.glb", (gltf) => {
+  const root = gltf.scene;
+  scene.add(root);
+  root.updateMatrixWorld(true);
+  const bones = new Map();
+  root.traverse((o) => { if (o.isBone) bones.set(normName(o.name), o); });
+  const aQuat = (o) => root.getWorldQuaternion(new THREE.Quaternion()).invert()
+    .multiply(o.getWorldQuaternion(new THREE.Quaternion()));
+  const aPos = (o) => root.worldToLocal(o.getWorldPosition(new THREE.Vector3()));
+
+  const hips = bones.get("hips");
+  const rUp = bones.get("rightupleg"), lUp = bones.get("leftupleg"), spine = bones.get("spine");
+  if (!hips || !rUp || !lUp || !spine) { console.warn("avatar: missing core bones", [...bones.keys()]); return; }
+  // Lower the avatar so its pelvis sits at the origin like the stick figure.
+  root.position.y = -aPos(hips).y;
+  root.updateMatrixWorld(true);
+
+  // Body axes in avatar space (rest pose): forward = up × right(R-hip − L-hip).
+  const bodyUp = aPos(spine).sub(aPos(hips)).normalize();
+  const bodyRight = aPos(rUp).sub(aPos(lUp)).normalize();
+  const bodyForward = new THREE.Vector3().crossVectors(bodyUp, bodyRight).normalize();
+
+  const entries = [];
+  const byName = new Map();
+  for (const [jp, jc, name] of BONE_TABLE) {
+    const bone = bones.get(name.toLowerCase());
+    const child = bone?.children.find((c) => c.isBone);
+    if (!bone || !bone.parent || !child) continue;
+    const restDirA = aPos(child).sub(aPos(bone)).normalize();
+    const restBoneInv = aQuat(bone).invert();
+    const limits = LIMITS[name];
+    const e = {
+      name, bone, jp, jc, limits,
+      restLocal: bone.quaternion.clone(),
+      restDirA,
+      parentRestA: aQuat(bone.parent),
+      axisLocal: restDirA.clone().applyQuaternion(restBoneInv).normalize(),
+    };
+    if (limits?.hinge) {
+      // Hinge axis: rotating the rest direction about it (+angle) moves the
+      // child toward the allowed bend direction.
+      const move = bodyForward.clone().multiplyScalar(limits.bend === "forward" ? 1 : -1);
+      const hingeA = new THREE.Vector3().crossVectors(restDirA, move).normalize();
+      e.hingeA = hingeA;
+      e.hingeLocal = hingeA.clone().applyQuaternion(restBoneInv).normalize();
+    }
+    entries.push(e);
+    byName.set(name, e);
+  }
+  for (const e of entries) {
+    if (e.limits?.hingeChild) e.hingeChild = byName.get(e.limits.hingeChild);
+  }
+  [hips, ...entries.map((e) => e.bone)].forEach((b) => restQuats.set(b, b.quaternion.clone()));
+  avatar = {
+    root, hips, aQuat, entries,
+    hipsRestA: aQuat(hips),
+    restFrameQuat: frameQuat(aPos(rUp).sub(aPos(lUp)), aPos(spine).sub(aPos(hips))),
+  };
+  applyMode();
+  if (lastJoints) updateAvatar(lastJoints);
+}, undefined, (err) => console.warn("avatar.glb not loaded (stick figure only)", err));
+
+/** Signed angle from a to b about unit axis n (a, b projected onto n's normal plane). */
+function signedAngleAbout(a, b, n) {
+  const pa = a.clone().projectOnPlane(n), pb = b.clone().projectOnPlane(n);
+  if (pa.lengthSq() < 1e-10 || pb.lengthSq() < 1e-10) return 0;
+  return Math.atan2(new THREE.Vector3().crossVectors(pa, pb).dot(n), pa.dot(pb));
+}
+
+function updateAvatar(j) {
+  if (!avatar) return;
+  const { hips, aQuat, entries, hipsRestA, restFrameQuat, root } = avatar;
+  // Solve on the live bones (children depend on their parents' solved rotation),
+  // record the results as targets, then put back what's on screen. The render
+  // loop eases the visible rotations toward the targets (see animateAvatar).
+  const posed = [hips, ...entries.map((e) => e.bone)];
+  const shown = posed.map((b) => b.quaternion.clone());
+  posed.forEach((b) => b.quaternion.copy(restOf(b)));
+  root.updateMatrixWorld(true);
+  const target = frameQuat(j[1].clone().sub(j[4]), j[7].clone().sub(j[0]));
+  const hipsA = target.multiply(restFrameQuat.clone().invert()).multiply(hipsRestA);
+  hips.quaternion.copy(aQuat(hips.parent).invert().multiply(hipsA));
+  hips.updateMatrixWorld(true);
+  for (const e of entries) {
+    const parentA = aQuat(e.bone.parent);
+    const cur = e.restDirA.clone().applyQuaternion(parentA.clone().multiply(e.parentRestA.clone().invert())).normalize();
+    const tgt = j[e.jc].clone().sub(j[e.jp]).normalize();
+    let boneA = new THREE.Quaternion().setFromUnitVectors(cur, tgt).multiply(parentA.clone().multiply(e.restLocal));
+
+    // Upper arm / thigh: roll the bone about its own axis so the child's hinge
+    // axis matches the real bend plane (otherwise twist is arbitrary).
+    const hc = limitsOn ? e.hingeChild : null;
+    if (hc) {
+      const lower = j[hc.jc].clone().sub(j[hc.jp]).normalize();
+      const n = new THREE.Vector3().crossVectors(tgt, lower);
+      if (n.length() > Math.sin(10 * D)) { // skip when the limb is nearly straight
+        n.normalize();
+        // Child's hinge axis carried along by this bone's rotation since rest.
+        const restBoneA = e.parentRestA.clone().multiply(e.restLocal);
+        const carried = hc.hingeA.clone().applyQuaternion(boneA.clone().multiply(restBoneA.invert()));
+        const roll = signedAngleAbout(carried, n, tgt);
+        boneA = axisAngle(tgt, roll).multiply(boneA);
+      }
+    }
+
+    let local = parentA.clone().invert().multiply(boneA);
+    if (limitsOn) local = constrainLocal(e, local);
+    e.bone.quaternion.copy(local);
+    e.bone.updateMatrixWorld(true);
+  }
+
+  avatar.targets = posed.map((b, i) => ({ bone: b, q: b.quaternion.clone() }));
+  posed.forEach((b, i) => b.quaternion.copy(shown[i]));
+  if (!smoothOn) snapAvatar();
+}
+
+// ---- Interpolation ----------------------------------------------------------
+// Each rendered frame, slerp every bone's local rotation a fraction of the way
+// toward its latest target: alpha = 1 - exp(-dt / TAU). This smooths the ~3 FPS
+// pose stream without waiting for a future pose (no extra frame of latency).
+const SMOOTH_TAU_S = 0.1;
+let smoothOn = true;
+const restQuats = new Map();
+const restOf = (bone) => restQuats.get(bone) ?? bone.quaternion;
+
+function snapAvatar() {
+  avatar?.targets?.forEach(({ bone, q }) => bone.quaternion.copy(q));
+}
+function animateAvatar(dt) {
+  if (!avatar?.targets) return;
+  if (!smoothOn) return snapAvatar();
+  const alpha = 1 - Math.exp(-dt / SMOOTH_TAU_S);
+  avatar.targets.forEach(({ bone, q }) => bone.quaternion.slerp(q, alpha));
+}
+
+// ---- View mode --------------------------------------------------------------
+let mode = "both";
+function applyMode() {
+  stick.visible = mode !== "avatar";
+  if (avatar) avatar.root.visible = mode !== "stick";
+  document.querySelectorAll("#modes button[data-mode]").forEach((b) => b.classList.toggle("active", b.dataset.mode === mode));
+}
+document.getElementById("limits").addEventListener("click", (e) => {
+  limitsOn = !limitsOn;
+  e.currentTarget.classList.toggle("active", limitsOn);
+  if (lastJoints) updateAvatar(lastJoints);
+});
+document.getElementById("smooth").addEventListener("click", (e) => {
+  smoothOn = !smoothOn;
+  e.currentTarget.classList.toggle("active", smoothOn);
+  if (!smoothOn) snapAvatar();
+});
+document.getElementById("modes").addEventListener("click", (e) => {
+  const m = e.target.dataset?.mode;
+  if (m) { mode = m; applyMode(); }
+});
+
+// ---- Stream -----------------------------------------------------------------
+const frameImg = document.getElementById("frame");
+const placeholder = document.getElementById("placeholder");
+const statsEl = document.getElementById("stats");
+const connEl = document.getElementById("conn");
+let lastJoints = null;
+let frameUrl = null;
+const recvTimes = [];
+
+function setConn(on, text) {
+  connEl.innerHTML = `<span class="dot ${on ? "on" : ""}"></span>${text}`;
+}
+
+function connect() {
+  const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/viewer/ws`);
+  ws.binaryType = "blob";
+  ws.onopen = () => setConn(true, "connected to server");
+  ws.onclose = () => { setConn(false, "disconnected — retrying"); setTimeout(connect, 1000); };
+  ws.onmessage = (ev) => {
+    if (ev.data instanceof Blob) {
+      if (frameUrl) URL.revokeObjectURL(frameUrl);
+      frameUrl = URL.createObjectURL(ev.data);
+      frameImg.src = frameUrl;
+      placeholder.style.display = "none";
+      return;
+    }
+    const msg = JSON.parse(ev.data);
+    const now = performance.now();
+    recvTimes.push(now);
+    while (recvTimes.length && now - recvTimes[0] > 2000) recvTimes.shift();
+
+    if (msg.status === "ok" && msg.joints) {
+      lastJoints = toSceneJoints(msg.joints);
+      updateStick(lastJoints, 1);
+      updateAvatar(lastJoints);
+    } else if (lastJoints) {
+      updateStick(lastJoints, 0.3);
+    }
+    const t = msg.timing_ms || {};
+    statsEl.textContent =
+      `status   ${msg.status}${msg.error ? ` (${msg.error})` : ""}\n` +
+      `frame    #${msg.frame_id}\n` +
+      `poses/s  ${(recvTimes.length / 2).toFixed(1)}\n` +
+      `2d       ${(t.prepare_2d ?? 0).toFixed(0)} ms\n` +
+      `3d       ${(t.pose_3d ?? 0).toFixed(0)} ms\n` +
+      `total    ${(t.total ?? 0).toFixed(0)} ms`;
+  };
+}
+connect();
+</script>
+</body>
+</html>
