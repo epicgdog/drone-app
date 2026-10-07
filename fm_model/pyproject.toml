@@ -1,0 +1,10 @@
+[project]
+name = "fm-model"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fmpose3d>=0.0.10",
+    "gdown>=6.4.1",
+]
