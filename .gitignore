@@ -9,6 +9,25 @@ wheels/
 # Virtual environments
 .venv
 
+# Tool caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# FMPose3D run outputs (training/eval checkpoints, downloaded weights)
+checkpoint/
+pre_trained_models/
+*.pth
+
+# Local agent / editor settings
+.claude/
+.vscode/
+.idea/
+
+# Secrets and logs
+.env
+.env.*
+*.log
 
 # datastore
 .DS_Store
